@@ -50,54 +50,59 @@ func (a *Analyzer) analyze(metadata AppImageMetadata) error {
 	}
 
 	for groupBP := range groupBPs {
-		analyzedDirectory := analyzedBuildPackDirectory{metadata, a.LayersDir, groupBP}
-
+		cache, err := a.readCache(groupBP)
+		analyzedDirectory := analyzedBuildPackDirectory{
+			metadata:  metadata,
+			layersDir: a.LayersDir,
+			groupBP:   groupBP,
+			cache:     cache,
+		}
 		layers, err := analyzedDirectory.allLayers()
 		if err != nil {
 			return err
 		}
 
-		for layer := range layers {
-
-			layerType := analyzedDirectory.classifyLayer(layer)
-
-			switch layerType {
-			case noMetaDataForLaunchLayer:
+		for layer, layerData := range layers {
+			cacheType := analyzedDirectory.classifyCache(layer)
+			switch cacheType {
+			case staleNoMetadata:
 				a.Out.Printf("removing stale cached layer '%s/%s', not in metadata \n", groupBP, layer)
-
 				if err := analyzedDirectory.removeLayer(layer); err != nil {
 					return err
 				}
-			case outdatedLaunchLayer:
-				a.Out.Printf("removing stale cached launch layer '%s/%s', writing updated metadata for layer \n", groupBP, layer)
-
+			case staleWrongSHA:
+				a.Out.Printf("removing stale cached launch layer '%s/%s'", groupBP, layer)
 				if err := analyzedDirectory.removeLayer(layer); err != nil {
 					return err
 				}
+			case nonLaunch:
+				a.Out.Printf("using cached layer '%s/%s'", groupBP, layer)
+			case valid:
+				a.Out.Printf("using cached launch layer '%s/%s'", groupBP, layer)
+			case noCache:
+				if layerData
+				a.Out.Printf("using cached launch layer '%s/%s'", groupBP, layer)
+			}
+		}
 
-				if err := analyzedDirectory.restoreMetadata(layer); err != nil {
-					return err
-				}
-			case outdatedBuildLayer:
-				a.Out.Printf("removing stale cached build layer '%s/%s' \n", groupBP, layer)
-
-				if err := analyzedDirectory.removeLayer(layer); err != nil {
-					return err
-				}
-			case noCacheAvailable:
+		for layer := range layers {
+			layerType := analyzedDirectory.classifyLayer(layer)
+			switch layerType {
+			case launchNoCache:
 				a.Out.Printf("writing metadata for layer '%s/%s'", groupBP, layer)
 
 				if err := analyzedDirectory.restoreMetadata(layer); err != nil {
 					return err
 				}
-			case existingCacheUptoDate:
-				a.Out.Printf("using cached layer '%s/%s' ", groupBP, layer)
-			case noMetaDataForBuildLayer:
-				a.Out.Printf("using cached build layer '%s/%s'", groupBP, layer)
-			default:
-				return fmt.Errorf("error, unexpected layer type %v", layer)
-			}
+			case launchBuildNoCache:
+				a.Out.Printf("writing metadata for layer '%s/%s'", groupBP, layer)
 
+				if err := analyzedDirectory.restoreMetadata(layer); err != nil {
+					return err
+				}
+			case launchCached, launchBuildCached
+				a.Out.Printf("using cached layer '%s/%s' ", groupBP, layer)
+			}
 		}
 	}
 
@@ -108,26 +113,25 @@ type analyzedBuildPackDirectory struct {
 	metadata  AppImageMetadata
 	layersDir string
 	groupBP   string
+	cache     map[string]*LayerMetadata
 }
 
 type layerType int
 
 const (
-	noMetaDataForLaunchLayer layerType = iota
-	noMetaDataForBuildLayer
-	outdatedLaunchLayer
-	outdatedBuildLayer
-	noCacheAvailable
-	existingCacheUptoDate
+	launchCached
+	launchNoCache
+	launchBuildCached
+	launchBuildNoCache
 )
 
 func (abd *analyzedBuildPackDirectory) classifyLayer(layer string) layerType {
 	cachedTOML, err := readTOML(abd.layerPath(layer) + ".toml")
 	if err != nil {
-		return noCacheAvailable
+		return noCacheLaunchLayer
 	}
 
-	buildpackMetadata, ok := appImageMetadata(abd.groupBP, abd.metadata)
+	buildpackMetadata, ok := bpMetadata(abd.groupBP, abd.metadata)
 	if !ok {
 		if !cachedTOML.Launch {
 			return noMetaDataForBuildLayer
@@ -147,7 +151,7 @@ func (abd *analyzedBuildPackDirectory) classifyLayer(layer string) layerType {
 
 	sha, err := ioutil.ReadFile(abd.layerPath(layer + ".sha"))
 	if err != nil {
-		return noCacheAvailable
+		return noCacheLaunchLayer
 	}
 
 	if string(sha) != layerMetadata.SHA {
@@ -159,7 +163,51 @@ func (abd *analyzedBuildPackDirectory) classifyLayer(layer string) layerType {
 	}
 
 	return existingCacheUptoDate
+}
 
+type cacheType int
+
+const (
+	staleNoMetadata cacheType = iota
+	staleWrongSHA
+	nonLaunch  //we can't determine whether the cache is stale for launch=false layers
+	valid
+	noCache
+)
+
+func (abd *analyzedBuildPackDirectory) classifyCache(name string) cacheType {
+	cachedLayer, ok := abd.cache[name]
+	if !ok {
+		return noCache
+	}
+	if !cachedLayer.Launch {
+		return nonLaunch
+	}
+	buildpackMetadata, ok := bpMetadata(abd.groupBP, abd.metadata)
+	layerMetadata, ok := buildpackMetadata.Layers[name]
+	if !ok {
+		return staleNoMetadata
+	}
+	if layerMetadata.SHA != cachedLayer.SHA {
+		return staleWrongSHA
+	}
+	return valid
+}
+
+func (a *Analyzer) readCache(bpID string) (map[string]*LayerMetadata, error) {
+	cache := make(map[string]*LayerMetadata)
+	tomls, err := filepath.Glob(filepath.Join(a.LayersDir, bpID, "*.toml"))
+	if err != nil {
+		return nil, err
+	}
+	for _, toml := range tomls {
+		name := strings.TrimRight(filepath.Base(toml), ".toml")
+		cache[name], _ = readTOML(toml)
+		if sha, err := ioutil.ReadFile(filepath.Join(a.LayersDir, bpID, name+".sha")); err == nil {
+			cache[name].SHA = string(sha)
+		}
+	}
+	return cache, nil
 }
 
 func (abd *analyzedBuildPackDirectory) layerPath(layer string) string {
@@ -168,7 +216,7 @@ func (abd *analyzedBuildPackDirectory) layerPath(layer string) string {
 
 func (abd *analyzedBuildPackDirectory) allLayers() (map[string]interface{}, error) {
 	setOfLayers := make(map[string]interface{})
-	buildpackMetadata, ok := appImageMetadata(abd.groupBP, abd.metadata)
+	buildpackMetadata, ok := bpMetadata(abd.groupBP, abd.metadata)
 	if ok {
 		for layer := range buildpackMetadata.Layers {
 			setOfLayers[layer] = struct{}{}
@@ -188,7 +236,7 @@ func (abd *analyzedBuildPackDirectory) allLayers() (map[string]interface{}, erro
 }
 
 func (abd *analyzedBuildPackDirectory) restoreMetadata(layer string) error {
-	buildpackMetadata, ok := appImageMetadata(abd.groupBP, abd.metadata)
+	buildpackMetadata, ok := bpMetadata(abd.groupBP, abd.metadata)
 	if !ok {
 		return fmt.Errorf("metadata unavailable for %s", layer)
 	}
@@ -214,7 +262,7 @@ func (abd *analyzedBuildPackDirectory) removeLayer(name string) error {
 	return nil
 }
 
-func appImageMetadata(groupBP string, metadata AppImageMetadata) (*BuildpackMetadata, bool) {
+func bpMetadata(groupBP string, metadata AppImageMetadata) (*BuildpackMetadata, bool) {
 	for _, buildpackMetaData := range metadata.Buildpacks {
 		if buildpackMetaData.ID == groupBP {
 			return &buildpackMetaData, true

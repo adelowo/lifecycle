@@ -159,6 +159,36 @@ func testAnalyzer(t *testing.T, when spec.G, it spec.S) {
 					}
 				})
 
+				when("there is a launch/build layer that isn't cached", func() {
+					it("should not restore the metadata", func() {
+						if err := analyzer.Analyze(image); err != nil {
+							t.Fatalf("Error: %s\n", err)
+						}
+						if _, err := ioutil.ReadFile(filepath.Join(layerDir, "buildpack.node/buildhelpers.toml")); !os.IsNotExist(err) {
+							t.Fatalf("Found unexpacted metadata for buildhelpers layer")
+						}
+					})
+				})
+
+				it("should only write layer TOML files that correspond to detected buildpacks", func() {
+					analyzer.Buildpacks = []*lifecycle.Buildpack{{ID: "buildpack.go"}}
+
+					if err := analyzer.Analyze(image); err != nil {
+						t.Fatalf("Error: %s\n", err)
+					}
+
+					if txt, err := ioutil.ReadFile(filepath.Join(layerDir, "buildpack.go", "go.toml")); err != nil {
+						t.Fatalf("Error: %s\n", err)
+					} else if !strings.Contains(string(txt), `[metadata]
+  version = "1.10"`) {
+						t.Fatalf(`Error: expected "%s" to be toml encoded go.toml`, txt)
+					}
+
+					if _, err := os.Stat(filepath.Join(layerDir, "buildpack.node")); !os.IsNotExist(err) {
+						t.Fatalf(`Error: expected /layer/buildpack.node to not exist`)
+					}
+				})
+
 				when("there are cached launch layers", func() {
 					it("leaves the layers", func() {
 						//copy to layerDir
